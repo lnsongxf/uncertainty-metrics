@@ -19,22 +19,7 @@
 
 import itertools
 import numpy as np
-
-
-def one_hot_encode(labels, num_classes=None):
-  """One hot encoder for turning a vector of labels into a OHE matrix."""
-  if num_classes is None:
-    num_classes = len(np.unique(labels))
-  return np.eye(num_classes)[labels]
-
-
-def mean(inputs):
-  """Be able to take the mean of an empty array without hitting NANs."""
-  # pylint disable necessary for numpy and pandas
-  if len(inputs) == 0:  # pylint: disable=g-explicit-length-test
-    return 0
-  else:
-    return np.mean(inputs)
+from uncertainty_metrics.numpy.base_calibration_error import BaseCalibrationError
 
 
 def get_adaptive_bins(predictions, num_bins):
@@ -61,12 +46,7 @@ def get_adaptive_bins(predictions, num_bins):
   return edges[1:]
 
 
-def binary_converter(probs):
-  """Converts a binary probability vector into a matrix."""
-  return np.array([[1-p, p] for p in probs])
-
-
-class GeneralCalibrationError():
+class GeneralCalibrationError(BaseCalibrationError):
   """Implements the space of calibration errors, General Calibration Error.
 
   This implementation of General Calibration Error can be class-conditional,
@@ -153,21 +133,14 @@ class GeneralCalibrationError():
                threshold=0.0,
                datapoints_per_bin=None,
                distribution=None):
-    self.binning_scheme = binning_scheme
-    self.max_prob = max_prob
-    self.class_conditional = class_conditional
-    self.norm = norm
-    self.num_bins = num_bins
-    self.threshold = threshold
-    self.datapoints_per_bin = datapoints_per_bin
-    self.distribution = distribution
-    self.accuracies = None
-    self.confidences = None
-    self.calibration_error = None
-    self.calibration_errors = None
+    super().__init__(max_prob, class_conditional, norm, threshold, distribution)
 
-  def get_calibration_error(self, probs, labels, bin_upper_bounds, norm,
-                            num_bins):
+    self.binning_scheme = binning_scheme
+    self.num_bins = num_bins
+    self.datapoints_per_bin = datapoints_per_bin
+
+  def get_binned_calibration_error(self, probs, labels, bin_upper_bounds,
+                                   norm, num_bins):
     """Given a binning scheme, returns sum weighted calibration error."""
     if np.size(probs) == 0:
       return 0.
@@ -195,30 +168,7 @@ class GeneralCalibrationError():
 
     return np.sum(np.abs(weighted_calibration_error))
 
-  def update_state(self, labels, probs):
-    """Updates the value of the General Calibration Error."""
-
-    # if self.calibration_error is not None and
-
-    probs = np.array(probs)
-    labels = np.array(labels)
-    if probs.ndim == 2:
-
-      num_classes = probs.shape[1]
-      if num_classes == 1:
-        probs = probs[:, 0]
-        probs = binary_converter(probs)
-        num_classes = 2
-    elif probs.ndim == 1:
-      # Cover binary case
-      probs = binary_converter(probs)
-      num_classes = 2
-    else:
-      raise ValueError('Probs must have 1 or 2 dimensions.')
-
-    # Convert the labels vector into a one-hot-encoded matrix.
-    labels_matrix = one_hot_encode(labels, probs.shape[1])
-
+  def binary_calibration_error(self, probs, binary_labels):
     if self.datapoints_per_bin is not None:
       self.num_bins = int(len(probs)/self.datapoints_per_bin)
       if self.binning_scheme != 'adaptive':
@@ -228,61 +178,12 @@ class GeneralCalibrationError():
     if self.binning_scheme == 'even':
       bin_upper_bounds = np.histogram_bin_edges(
           [], bins=self.num_bins, range=(0.0, 1.0))[1:]
-
-    # When class_conditional is False, different classes are conflated.
-    if not self.class_conditional:
-      if self.max_prob:
-        labels_matrix = labels_matrix[
-            range(len(probs)), np.argmax(probs, axis=1)]
-        probs = probs[range(len(probs)), np.argmax(probs, axis=1)]
-      labels_matrix = labels_matrix[probs > self.threshold]
-      probs = probs[probs > self.threshold]
-      if self.binning_scheme == 'adaptive':
-        bin_upper_bounds = get_adaptive_bins(probs, self.num_bins)
-      calibration_error = self.get_calibration_error(
-          probs.flatten(), labels_matrix.flatten(), bin_upper_bounds, self.norm,
-          self.num_bins)
-
-    # If class_conditional is true, predictions from different classes are
-    # binned separately.
-    else:
-      # Initialize list for class calibration errors.
-      class_calibration_error_list = []
-      for j in range(num_classes):
-        if not self.max_prob:
-          probs_slice = probs[:, j]
-          labels = labels_matrix[:, j]
-          labels = labels[probs_slice > self.threshold]
-          probs_slice = probs_slice[probs_slice > self.threshold]
-          if self.binning_scheme == 'adaptive':
-            bin_upper_bounds = get_adaptive_bins(probs_slice, self.num_bins)
-          calibration_error = self.get_calibration_error(
-              probs_slice, labels, bin_upper_bounds, self.norm, self.num_bins)
-          class_calibration_error_list.append(calibration_error/num_classes)
-        else:
-          # In the case where we use all datapoints,
-          # max label has to be applied before class splitting.
-          labels = labels_matrix[np.argmax(probs, axis=1) == j][:, j]
-          probs_slice = probs[np.argmax(probs, axis=1) == j][:, j]
-          labels = labels[probs_slice > self.threshold]
-          probs_slice = probs_slice[probs_slice > self.threshold]
-          if self.binning_scheme == 'adaptive':
-            bin_upper_bounds = get_adaptive_bins(probs_slice, self.num_bins)
-          calibration_error = self.get_calibration_error(
-              probs_slice, labels, bin_upper_bounds, self.norm, self.num_bins)
-          class_calibration_error_list.append(calibration_error/num_classes)
-      calibration_error = np.sum(class_calibration_error_list)
-
-    if self.norm == 'l2':
-      calibration_error = np.sqrt(calibration_error)
-
-    self.calibration_error = calibration_error
-
-  def result(self):
-    return self.calibration_error
-
-  def reset_state(self):
-    self.calibration_error = None
+    if self.binning_scheme == 'adaptive':
+      bin_upper_bounds = get_adaptive_bins(probs, self.num_bins)
+    calibration_error = self.get_binned_calibration_error(
+        probs, binary_labels, bin_upper_bounds,
+        self.norm, self.num_bins)
+    return calibration_error
 
 
 def gce(labels,
@@ -352,7 +253,7 @@ def gce(labels,
     norm: String, apply 'l1' or 'l2' norm to the calibration error.
     num_bins: Integer, number of bins of confidence scores to use.
     threshold: Float, only look at probabilities above a certain value.
-    datapoints_per_bin: Int, number of datapoints in each adaptive bin. This
+    datapoints_per_bin: Int, numer of datapoints in each adaptive bin. This
       is a second option when binning adaptively - you can use either num_bins
       or this method to determine the bin size.
 

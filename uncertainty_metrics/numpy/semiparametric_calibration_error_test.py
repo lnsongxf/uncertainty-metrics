@@ -31,9 +31,9 @@ class SemiparametricCalibrationErrorTest(absltest.TestCase):
     probs = np.random.rand(n)
     calibration_error = 0.7 * probs ** 2 + 0.3 * probs
     # Simulate outcomes according to this model.
-    labels = (np.random.rand(n) <= calibration_error).astype(np.float)
+    labels = (np.random.rand(n) <= calibration_error).astype(np.integer)
     ce = um.SPCE(smoothing='spline')
-    est = ce.rms_calibration_error(probs, labels)
+    est = ce.binary_calibration_error(probs, labels)
     self.assertGreaterEqual(est, 0)
     self.assertLessEqual(est, 1)
 
@@ -42,7 +42,7 @@ class SemiparametricCalibrationErrorTest(absltest.TestCase):
     probs = np.random.rand(n)
     calibration_error = 0.7 * probs ** 2 + 0.3 * probs
     # Simulate outcomes according to this model.
-    labels = (np.random.rand(n) <= calibration_error).astype(np.float)
+    labels = (np.random.rand(n) <= calibration_error).astype(np.integer)
     est = um.spce(probs, labels, smoothing='spline')
     self.assertGreaterEqual(est, 0)
     self.assertLessEqual(est, 1)
@@ -52,7 +52,7 @@ class SemiparametricCalibrationErrorTest(absltest.TestCase):
     probs = np.random.rand(n)
     calibration_error = 0.7 * probs ** 2 + 0.3 * probs
     # Simulate outcomes according to this model.
-    labels = (np.random.rand(n) <= calibration_error).astype(np.float)
+    labels = (np.random.rand(n) <= calibration_error).astype(np.integer)
     lower_ci, _, upper_ci = um.spce_conf_int(
         probs, labels, smoothing='spline')
     self.assertGreaterEqual(lower_ci, 0)
@@ -70,7 +70,38 @@ class SemiparametricCalibrationErrorTest(absltest.TestCase):
     # continuous. Therefore, pass in a KFold object.
     ce = um.SPCE(smoothing='spline',
                  fold_generator=sklearn.model_selection.KFold(5, shuffle=True))
-    est = ce.rms_calibration_error(probs, calibration_error)
+    est = ce.binary_calibration_error(probs, calibration_error)
+    self.assertGreaterEqual(est, 0)
+    self.assertLessEqual(est, 1)
+
+  def test_shared_api(self):
+    n = 2000
+    probs = np.random.rand(n)
+    calibration_error = 0.7 * probs ** 2 + 0.3 * probs
+    # Simulate outcomes according to this model.
+    labels = (np.random.rand(n) <= calibration_error).astype(np.integer)
+    ce = um.SPCE(smoothing='spline')
+    ce.update_state(labels, probs)
+    est = ce.result()
+    self.assertGreaterEqual(est, 0)
+    self.assertLessEqual(est, 1)
+
+  def test_multilabel(self):
+    pred_probs = [
+        [0.31, 0.32, 0.27],
+        [0.37, 0.33, 0.30],
+        [0.30, 0.31, 0.39],
+        [0.61, 0.38, 0.01],
+        [0.10, 0.65, 0.25],
+        [0.91, 0.05, 0.04],
+    ]
+    # max_pred_probs: [0.32, 0.37, 0.39, 0.61, 0.65, 0.91]
+    # pred_class: [1, 0, 2, 0, 1, 0]
+    labels = [1., 0, 2., 1., 2., 0.]
+
+    spce = um.SPCE(folds=2)
+    spce.update_state([int(i) for i in labels], np.array(pred_probs))
+    est = spce.result()
     self.assertGreaterEqual(est, 0)
     self.assertLessEqual(est, 1)
 

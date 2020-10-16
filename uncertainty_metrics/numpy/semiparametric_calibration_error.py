@@ -42,16 +42,21 @@ import numpy as np
 import scipy.interpolate
 import scipy.stats
 import sklearn.model_selection
+from uncertainty_metrics.numpy.base_calibration_error import BaseCalibrationError
 
 
-class SemiparametricCalibrationError(object):
+class SemiparametricCalibrationError(BaseCalibrationError):
   """Class implementing Semiparametric Calibration Error."""
 
   def __init__(self, folds=5, weight_trunc=0.05, weights='constant',
                bootstrap_size=500, orthogonal=False, normalize=False,
                smoothing='kernel', hyperparam_attempts=50,
-               default_hyperparam_range=None, verbose=False,
-               fold_generator=None):
+               hyperparam_range=None, verbose=False,
+               max_prob=False, class_conditional=True,
+               fold_generator=None, norm='l2', **kwargs):
+    if norm != 'l2':
+      raise ValueError(f'This metric only accepts l2 norm, not {norm}')
+    super().__init__(max_prob, class_conditional, norm=norm, **kwargs)
     # Folds are used for cross validation of hyperparameter (smoothness)
     # choices as well as cross fitting of semiparametric nuisance params.
     self.folds = folds
@@ -65,19 +70,28 @@ class SemiparametricCalibrationError(object):
     self.verbose = verbose
     self.smoothing = smoothing
     self.normalize = normalize
-    self.hyperparam_attempts = hyperparam_attempts
     self.weights = weights
+    self.hyperparam_attempts = hyperparam_attempts
+    self.hyperparam_range = hyperparam_range
 
-    if default_hyperparam_range is None:
-      # Use reasonable default hyperparam ranges validated in simulation. These
-      # scale adaptive estimates made once basic properties of the data are
-      # known.
-      if smoothing == 'kernel':
-        default_hyperparam_range = (0, 0.1)
-      if smoothing == 'spline':
-        default_hyperparam_range = (0.5, 1.1)
-
-    self.default_hyperparam_range = default_hyperparam_range
+  def _set_default_hyperparams(self, probs, labels):
+    # Use reasonable default hyperparam ranges validated in simulation. These
+    # scale adaptive estimates made once basic properties of the data are
+    # known.
+    if self.smoothing == 'spline':
+      scale_lower, scale_upper = 0.5, 1.1
+      w = self.weight_function(probs)
+      w /= np.mean(w)
+      max_val = np.sum(w**2 * probs * (1 - probs))
+      self.hyperparam_range = np.linspace(scale_lower * max_val,
+                                          scale_upper * max_val,
+                                          self.hyperparam_attempts)
+    if self.smoothing == 'kernel':
+      scale_lower, scale_upper = 0, 0.1
+      self.hyperparam_range = (
+          np.linspace(scale_lower * probs.shape[0] + 1,
+                      scale_upper * probs.shape[0], self.hyperparam_attempts) /
+          (np.max(probs) - np.min(probs)))**2
 
   def _relative_weights(self, probs):
     return 1.0 / np.maximum(np.minimum(probs**2, (1 - probs)**2),
@@ -128,54 +142,37 @@ class SemiparametricCalibrationError(object):
 
     return est, se
 
-  def rms_calibration_error(self,
-                            probs,
-                            labels,
-                            hyperparam_range=None):
+  def binary_calibration_error(self, probs, binary_labels):
     """Low bias estimate of L2 calibration error w/ smoothing, not bins."""
     est, _ = self._calculate_calibration_error_crossfit(
-        probs, labels, hyperparam_range=hyperparam_range)
+        np.array(probs), np.array(binary_labels).astype(np.float))
     return np.sqrt(max(est, 0))
 
-  def rms_calibration_error_conf_int(self, probs, labels,
-                                     hyperparam_range=None, alpha=0.05):
+  def binary_calibration_error_conf_int(self, probs, binary_labels, alpha=0.05):
     """Confidence interval for L2 calibration error."""
     # Estimates L2 calibration error using a semi-parametric method that
     # reduces the bias of binning estimates of accuracy conditional on
     # confidence, and provides statistically valid confidence intervals for the
     # calibration error.
     est, se = self._calculate_calibration_error_crossfit(
-        probs, labels, hyperparam_range=hyperparam_range)
+        np.array(probs), np.array(binary_labels).astype(np.float))
     z_alpha_div_2 = -scipy.stats.norm.ppf(alpha / 2.0)
     return (np.sqrt(max(est - z_alpha_div_2 * se, 0)),
             np.sqrt(max(est, 0)),
             np.sqrt(max(est + z_alpha_div_2 * se, 0)))
 
-  def _calculate_calibration_error_crossfit(self, probs, labels,
-                                            hyperparam_range=None):
+  def _calculate_calibration_error_crossfit(self, probs, labels):
     """Compute calib error using best hyperparams for calibration function."""
-    if hyperparam_range is None:
-      if self.smoothing == 'spline':
-        w = self.weight_function(probs)
-        w /= np.mean(w)
-        max_val = np.sum(w ** 2 * probs * (1-probs))
-        scale_lower, scale_upper = self.default_hyperparam_range
-        hyperparam_range = np.linspace(scale_lower * max_val,
-                                       scale_upper * max_val,
-                                       self.hyperparam_attempts)
-      if self.smoothing == 'kernel':
-        scale_lower, scale_upper = self.default_hyperparam_range
-        hyperparam_range = (np.linspace(
-            scale_lower * probs.shape[0] + 1, scale_upper * probs.shape[0],
-            self.hyperparam_attempts) / (np.max(probs) - np.min(probs)))**2
+    if self.hyperparam_range is None:
+      self._set_default_hyperparams(probs, labels)
 
     return self._calculate_calibration_error(
         probs, labels,
         self._calculate_opt_cross_fit_calibration_function(
-            probs, labels, hyperparam_range))
+            probs, labels))
 
   def _calculate_calibration_function(self, train_probs, train_labels,
-                                      test_probs, sigma=1):
+                                      test_probs, hyperparam=1):
     """Compute smoothing estimate of calibration function."""
     # Calibration function is the expected accuracy conditional on the
     # confidence / probabilities outputted by the prediction model. This
@@ -186,12 +183,12 @@ class SemiparametricCalibrationError(object):
     train_labels -= train_probs
     if self.smoothing == 'kernel':
       dists = np.abs(train_probs[np.newaxis, :] - test_probs[:, np.newaxis])
-      kernel = np.exp(-sigma * (dists ** 2))
+      kernel = np.exp(-hyperparam * (dists ** 2))
       preds = kernel.dot(train_labels) / kernel.sum(axis=1)
     elif self.smoothing == 'spline':
       order = np.argsort(train_probs)
       s = scipy.interpolate.UnivariateSpline(
-          train_probs[order], train_labels[order], s=sigma, w=weights)
+          train_probs[order], train_labels[order], s=hyperparam, w=weights)
       preds = s(test_probs)
     else:
       raise Exception(
@@ -200,24 +197,24 @@ class SemiparametricCalibrationError(object):
     return preds
 
   def _calculate_cross_fit_calibration_function(self, probs, labels,
-                                                hyperparams):
+                                                hyperparam):
     """Helper function to estimate the calibration function w/ cross fitting."""
     accs = np.zeros(labels.shape)
     for train_index, test_index in self.kf.split(probs, labels):
       train_probs, test_probs = probs[train_index], probs[test_index]
       train_labels = labels[train_index]
       accs[test_index] = self._calculate_calibration_function(
-          train_probs, train_labels, test_probs, hyperparams)
+          train_probs, train_labels, test_probs, hyperparam=hyperparam)
     return accs
 
-  def _choose_opt_calibration_hyperparam(self, probs, labels, hyperparam_range):
+  def _choose_opt_calibration_hyperparam(self, probs, labels):
     """Gets optimal prediction hyperparam from list hyperparam_range."""
     weights = self.weight_function(probs)
     weights /= np.mean(weights)
 
     best_error = np.float('inf')
     best_hyperparam = None
-    for hyperparam in hyperparam_range:
+    for hyperparam in self.hyperparam_range:
       accs = self._calculate_cross_fit_calibration_function(
           probs, labels, hyperparam)
       error = np.mean(weights * (accs - labels) ** 2)
@@ -225,11 +222,11 @@ class SemiparametricCalibrationError(object):
         best_error = error
         best_hyperparam = hyperparam
     if self.verbose:
-      print('Tried hyperparams: {}'.format(hyperparam_range))
+      print('Tried hyperparams: {}'.format(self.hyperparam_range))
       print('Best hyperparam: {}'.format(best_hyperparam))
     return best_hyperparam
 
-  def _get_undersmoothed_hyperparam(self, probs, labels, hyperparam_range):
+  def _get_undersmoothed_hyperparam(self, probs, labels):
     """Adjust optimal hyperparam to work for semiparametric estimation."""
     # The optimal hyperparams for prediction of accuracy with the calibration
     # function are generally more smooth than one wants when plugging them in to
@@ -238,7 +235,7 @@ class SemiparametricCalibrationError(object):
     # amount.
     n = labels.shape[0]
     opt_hyperparam = self._choose_opt_calibration_hyperparam(
-        probs, labels, hyperparam_range)
+        probs, labels)
     if self.smoothing == 'kernel':
       opt_hyperparam *= n ** 0.08
     else:
@@ -249,17 +246,16 @@ class SemiparametricCalibrationError(object):
     return opt_hyperparam
 
   def _calculate_opt_cross_fit_calibration_function(
-      self, probs, labels, hyperparam_range):
+      self, probs, labels):
     """Get best, cross fit calibration function for semiparametric estimator."""
     hyperparam = self._get_undersmoothed_hyperparam(
-        probs, labels, hyperparam_range)
+        probs, labels)
 
     return self._calculate_cross_fit_calibration_function(
         probs, labels, hyperparam)
 
 
-def semiparametric_calibration_error(
-    probs, labels, hyperparam_range=None, **class_kwargs):
+def semiparametric_calibration_error(probs, labels, **class_kwargs):
   """Estimate of L2 calibration error.
 
   Estimates L2 calibration error using a semi-parametric method that
@@ -270,21 +266,18 @@ def semiparametric_calibration_error(
   Args:
     probs: np.ndarray of shape [N, ] where N is the number of datapoints.
     labels: np.ndarray of shape [N, ] array of correct binary labels.
-    hyperparam_range: np.ndarray of smoothing parameters to try when estimating
-        the calibration function. If None is provided, will try to use
-        reasonable defaults that worked well in simulation.
     **class_kwargs: dict to be provided to class construction with other
-        hyperparameter options.
+      hyperparameter options.
 
   Returns:
     Float, general calibration error.
   """
-  ce = SemiparametricCalibrationError(**class_kwargs)
-  return ce.rms_calibration_error(probs, labels, hyperparam_range)
+  metric = SemiparametricCalibrationError(**class_kwargs)
+  metric.update_state(labels, probs)
+  return metric.result()
 
 
-def semiparametric_calibration_error_conf_int(
-    probs, labels, hyperparam_range=None, **class_kwargs):
+def semiparametric_calibration_error_conf_int(probs, labels, **class_kwargs):
   """Confidence interval for L2 calibration error.
 
   Estimates L2 calibration error using a semi-parametric method that
@@ -295,9 +288,6 @@ def semiparametric_calibration_error_conf_int(
   Args:
     probs: np.ndarray of shape [N, ] where N is the number of datapoints.
     labels: np.ndarray of shape [N, ] array of correct binary labels.
-    hyperparam_range: np.ndarray of smoothing parameters to try when estimating
-        the calibration function. If None is provided, will try to use
-        reasonable defaults that worked well in simulation.
     **class_kwargs: dict to be provided to class construction with other
         hyperparameter options.
 
@@ -307,7 +297,7 @@ def semiparametric_calibration_error_conf_int(
     Float, Upper CI on L2 calibration error.
   """
   ce = SemiparametricCalibrationError(**class_kwargs)
-  return ce.rms_calibration_error_conf_int(probs, labels, hyperparam_range)
+  return ce.binary_calibration_error_conf_int(probs, labels)
 
 
 spce = semiparametric_calibration_error
